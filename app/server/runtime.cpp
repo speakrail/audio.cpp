@@ -25,6 +25,7 @@
 #include "engine/framework/model_spec/package.h"
 #include "engine/framework/runtime/errors.h"
 #include "engine/framework/runtime/registry.h"
+#include "engine/models/voxtral_realtime/session.h"
 
 #include <algorithm>
 #include <atomic>
@@ -32,7 +33,11 @@
 #include <cmath>
 #include <cctype>
 #include <cstdint>
+#include <deque>
 #include <fstream>
+#include <future>
+#include <memory>
+#include <mutex>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -54,6 +59,102 @@ using minitts::app::base64_decode;
 using minitts::app::base64_encode;
 
 using Clock = std::chrono::steady_clock;
+
+// Speakrail patch (live peek): a live request that carries `live_id` registers a mailbox here for its
+// lifetime. POST /v1/audio/transcriptions/live/peek?live_id=..&frames=N queues a request in it and waits;
+// the live stream's own thread services the queue between two audio chunks (inside its chunk reader), so the
+// peek runs on the session with nothing else touching it, between two chunks.
+struct LivePeekRequest {
+    int64_t frames = 8;
+    std::promise<std::string> result;
+};
+
+struct LivePeekMailbox {
+    std::mutex mu;
+    std::deque<std::shared_ptr<LivePeekRequest>> queue;
+};
+
+std::mutex g_live_peek_mu;
+std::unordered_map<std::string, std::shared_ptr<LivePeekMailbox>> g_live_peek;
+
+std::string live_peek_json(const engine::runtime::StreamEvent & event, double ms) {
+    std::ostringstream out;
+    out.precision(4);
+    out << "{\"type\":\"transcript.peek_steps\",\"ms\":" << ms << ",\"steps\":[";
+    for (size_t i = 0; i < event.decoded_steps.size(); ++i) {
+        const auto & st = event.decoded_steps[i];
+        if (i != 0) {
+            out << ",";
+        }
+        out << "{\"frame\":" << st.frame << ",\"token\":" << st.token << ",\"text\":" << json_quote(st.text);
+        if (!st.turn.empty()) {
+            out << ",\"turn\":[";
+            for (size_t j = 0; j < st.turn.size(); ++j) {
+                if (j != 0) {
+                    out << ",";
+                }
+                out << st.turn[j];
+            }
+            out << "]";
+        }
+        out << "}";
+    }
+    out << "]}";
+    return out.str();
+}
+
+void service_live_peeks(LivePeekMailbox & box, engine::runtime::IVoiceTaskSession * session) {
+    std::deque<std::shared_ptr<LivePeekRequest>> todo;
+    {
+        std::lock_guard<std::mutex> lock(box.mu);
+        todo.swap(box.queue);
+    }
+    for (auto & req : todo) {
+        try {
+            auto * vs = dynamic_cast<engine::models::voxtral_realtime::VoxtralRealtimeSession *>(session);
+            if (vs == nullptr) {
+                req->result.set_value("{\"error\":\"peek needs a voxtral_realtime live session\"}");
+                continue;
+            }
+            const auto started = Clock::now();
+            const auto event = vs->peek_stream(req->frames);
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+            req->result.set_value(live_peek_json(event, ms));
+        } catch (const std::exception & ex) {
+            req->result.set_value(std::string("{\"error\":") + json_quote(ex.what()) + "}");
+        }
+    }
+}
+
+HttpResponse handle_live_peek(const HttpRequest & request) {
+    const std::string live_id = query_param(request.query, "live_id");
+    if (live_id.empty()) {
+        return error_response(400, "peek requires a 'live_id' query parameter", "invalid_request_error");
+    }
+    std::shared_ptr<LivePeekMailbox> box;
+    {
+        std::lock_guard<std::mutex> lock(g_live_peek_mu);
+        const auto it = g_live_peek.find(live_id);
+        if (it != g_live_peek.end()) {
+            box = it->second;
+        }
+    }
+    if (box == nullptr) {
+        return error_response(404, "no live transcription with live_id " + live_id, "not_found");
+    }
+    auto req = std::make_shared<LivePeekRequest>();
+    const std::string frames = query_param(request.query, "frames");
+    req->frames = frames.empty() ? 8 : std::max<int64_t>(1, std::min<int64_t>(40, std::stoll(frames)));
+    auto result = req->result.get_future();
+    {
+        std::lock_guard<std::mutex> lock(box->mu);
+        box->queue.push_back(req);
+    }
+    if (result.wait_for(std::chrono::milliseconds(1500)) != std::future_status::ready) {
+        return error_response(504, "the live stream did not service the peek in time", "timeout");
+    }
+    return json_response(result.get());
+}
 
 class CallbackRecipeModelExecutor final : public minitts::app::IRecipeModelExecutor {
 public:
@@ -215,6 +316,9 @@ HttpResponse ServerState::handle_request(const HttpRequest & request, bool use_f
             }
             if (extra.method == "POST" && extra.path == "/v1/recipes/run") {
                 return handle_recipe_run(extra.body);
+            }
+            if (extra.method == "POST" && extra.path == "/v1/audio/transcriptions/live/peek") {
+                return handle_live_peek(extra);   // Speakrail patch (live peek)
             }
             return std::nullopt;
         });
@@ -1958,11 +2062,38 @@ HttpResponse ServerState::handle_transcription_live(const HttpRequest & request)
     }
 
     std::istream * pcm_input = request.body_stream;
+    const std::string live_id = query_param(request.query, "live_id");   // Speakrail patch (live peek)
     return sse_response(
-        [this, model_ptr, task_request, pcm_input, sample_rate, channels, sample_format, busy_timeout_ms, diarization](
+        [this, model_ptr, task_request, pcm_input, sample_rate, channels, sample_format, busy_timeout_ms, diarization, live_id](
             HttpStreamWriter & writer) {
             const minitts::app::AudioStreamFormat format{sample_rate, channels};
-            const auto audio = minitts::app::make_pcm_chunk_stream(*pcm_input, format, sample_format);
+            auto audio = minitts::app::make_pcm_chunk_stream(*pcm_input, format, sample_format);
+            // Speakrail patch (live peek): register a mailbox for this live_id and service it from the chunk
+            // reader, which runs on this stream's thread between two process_audio_chunk calls.
+            std::shared_ptr<LivePeekMailbox> peek_box;
+            struct PeekRegistration {
+                std::string id;
+                ~PeekRegistration() {
+                    if (!id.empty()) {
+                        std::lock_guard<std::mutex> lock(g_live_peek_mu);
+                        g_live_peek.erase(id);
+                    }
+                }
+            } peek_registration;
+            if (!live_id.empty()) {
+                peek_box = std::make_shared<LivePeekMailbox>();
+                {
+                    std::lock_guard<std::mutex> lock(g_live_peek_mu);
+                    g_live_peek[live_id] = peek_box;
+                }
+                peek_registration.id = live_id;
+                auto inner = audio.read;
+                auto * session = model_ptr->session.get();
+                audio.read = [inner, peek_box, session](int64_t max_samples, std::vector<float> & samples) {
+                    service_live_peeks(*peek_box, session);
+                    return inner(max_samples, samples);
+                };
+            }
             const auto timed_result = run_streaming_model_from(
                 *model_ptr,
                 task_request,
@@ -1973,6 +2104,34 @@ HttpResponse ServerState::handle_transcription_live(const HttpRequest & request)
                             write_sse(writer, diarization_event_json(event.speaker_turns, sample_rate, false));
                         }
                         return;
+                    }
+                    if (!event.decoded_steps.empty()) {
+                        // Speakrail patch: one entry per decoder step, text or not, with the
+                        // frame it describes and the turn head's probabilities when loaded.
+                        std::ostringstream out;
+                        out.precision(4);
+                        out << "{\"type\":\"transcript.steps\",\"steps\":[";
+                        for (size_t i = 0; i < event.decoded_steps.size(); ++i) {
+                            const auto & st = event.decoded_steps[i];
+                            if (i != 0) {
+                                out << ",";
+                            }
+                            out << "{\"frame\":" << st.frame << ",\"token\":" << st.token
+                                << ",\"text\":" << json_quote(st.text);
+                            if (!st.turn.empty()) {
+                                out << ",\"turn\":[";
+                                for (size_t j = 0; j < st.turn.size(); ++j) {
+                                    if (j != 0) {
+                                        out << ",";
+                                    }
+                                    out << st.turn[j];
+                                }
+                                out << "]";
+                            }
+                            out << "}";
+                        }
+                        out << "]}";
+                        write_sse(writer, out.str());
                     }
                     if (event.partial_text_snapshot.has_value()) {
                         write_sse(writer, "{\"type\":\"transcript.text.partial\",\"text\":" +

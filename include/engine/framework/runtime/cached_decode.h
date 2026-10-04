@@ -92,6 +92,16 @@ public:
         return graph_ != nullptr;
     }
 
+    // Speakrail patch (live peek): the policy is a small value (cursor + config); a peek copies it
+    // out and back around its throw-away decode steps.
+    Policy policy_snapshot() const {
+        return policy_;
+    }
+
+    void restore_policy(const Policy & policy) {
+        policy_ = policy;
+    }
+
     Graph & graph() {
         if (graph_ == nullptr) {
             throw std::runtime_error(policy_.label() + " graph is not initialized");
