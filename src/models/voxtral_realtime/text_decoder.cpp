@@ -1,4 +1,5 @@
 #include "engine/models/voxtral_realtime/text_decoder.h"
+#include "engine/models/voxtral_realtime/tensor_snapshot.h"
 
 #include "engine/framework/core/backend.h"
 #include "engine/framework/core/backend_weight_store.h"
@@ -24,6 +25,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -75,6 +77,79 @@ struct TextWeights {
     core::TensorValue norm;
     core::TensorValue lm_head;
 };
+
+// Speakrail patch: MLP turn-taking head on the residual after decoder layer `tap`
+// (softmax(W2 gelu(W1 ((h - mu) / sd) + b1) + b2); mu/sd are folded into W1/b1 by the exporter).
+// File layout: "VXTHEAD1", int32 tap, d_in, hidden, classes,
+// f32 w1[hidden][d_in], b1[hidden], w2[classes][hidden], b2[classes], then the class names,
+// one per line, to EOF.
+struct TurnHeadWeights {
+    int64_t tap = 0;
+    int64_t d_in = 0;
+    int64_t hidden = 0;
+    int64_t classes = 0;
+    std::vector<float> w1;
+    std::vector<float> b1;
+    std::vector<float> w2;
+    std::vector<float> b2;
+    std::vector<std::string> names;
+};
+
+std::unique_ptr<TurnHeadWeights> load_turn_head(const std::string & path, int64_t hidden_size, int64_t num_layers) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("VoxTral turn head: cannot open " + path);
+    }
+    char magic[8];
+    in.read(magic, 8);
+    if (!in || std::memcmp(magic, "VXTHEAD1", 8) != 0) {
+        throw std::runtime_error("VoxTral turn head: bad magic in " + path);
+    }
+    int32_t dims[4];
+    in.read(reinterpret_cast<char *>(dims), sizeof(dims));
+    if (!in) {
+        throw std::runtime_error("VoxTral turn head: truncated header in " + path);
+    }
+    auto head = std::make_unique<TurnHeadWeights>();
+    head->tap = dims[0];
+    head->d_in = dims[1];
+    head->hidden = dims[2];
+    head->classes = dims[3];
+    if (head->d_in != hidden_size) {
+        throw std::runtime_error("VoxTral turn head: d_in " + std::to_string(head->d_in) +
+                                 " != decoder hidden size " + std::to_string(hidden_size));
+    }
+    if (head->tap < 0 || head->tap >= num_layers) {
+        throw std::runtime_error("VoxTral turn head: tap layer " + std::to_string(head->tap) + " out of range");
+    }
+    if (head->hidden <= 0 || head->classes <= 0) {
+        throw std::runtime_error("VoxTral turn head: bad hidden/classes in " + path);
+    }
+    const auto read_f32 = [&](std::vector<float> & out, int64_t count, const char * what) {
+        out.resize(static_cast<size_t>(count));
+        in.read(reinterpret_cast<char *>(out.data()), static_cast<std::streamsize>(count * sizeof(float)));
+        if (!in) {
+            throw std::runtime_error(std::string("VoxTral turn head: truncated ") + what + " in " + path);
+        }
+    };
+    read_f32(head->w1, head->hidden * head->d_in, "w1");
+    read_f32(head->b1, head->hidden, "b1");
+    read_f32(head->w2, head->classes * head->hidden, "w2");
+    read_f32(head->b2, head->classes, "b2");
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty()) {
+            head->names.push_back(line);
+        }
+    }
+    if (static_cast<int64_t>(head->names.size()) != head->classes) {
+        head->names.clear();
+        for (int64_t c = 0; c < head->classes; ++c) {
+            head->names.push_back("class" + std::to_string(c));
+        }
+    }
+    return head;
+}
 
 assets::TensorStorageType normalize_weight_storage(assets::TensorStorageType storage_type) {
     switch (storage_type) {
@@ -678,13 +753,15 @@ public:
         core::BackendType backend_type,
         int threads,
         int64_t cache_steps,
-        size_t arena_bytes)
+        size_t arena_bytes,
+        const TurnHeadWeights * turn_head = nullptr)
         : assets_(std::move(assets)),
           weights_(std::move(weights)),
           backend_(backend),
           backend_type_(backend_type),
           threads_(threads),
-          cache_steps_(cache_steps) {
+          cache_steps_(cache_steps),
+          turn_head_(turn_head) {
         if (cache_steps_ <= 0) {
             throw std::runtime_error("VoxTral text decoder step graph requires positive cache length");
         }
@@ -731,9 +808,22 @@ public:
                 core::TensorShape::from_dims({1, cache_steps_, config.num_key_value_heads, config.head_dim}),
                 GGML_TYPE_F32));
         }
+        if (turn_head_ != nullptr) {
+            // ggml mul_mat(a, b): a = [ne0 = in, ne1 = out] holds a row-major [out][in] weight.
+            head_w1_ = ggml_new_tensor_2d(state_ctx_.get(), GGML_TYPE_F32, turn_head_->d_in, turn_head_->hidden);
+            head_b1_ = ggml_new_tensor_1d(state_ctx_.get(), GGML_TYPE_F32, turn_head_->hidden);
+            head_w2_ = ggml_new_tensor_2d(state_ctx_.get(), GGML_TYPE_F32, turn_head_->hidden, turn_head_->classes);
+            head_b2_ = ggml_new_tensor_1d(state_ctx_.get(), GGML_TYPE_F32, turn_head_->classes);
+        }
         state_buffer_ = ggml_backend_alloc_ctx_tensors(state_ctx_.get(), backend_);
         if (state_buffer_ == nullptr) {
             throw std::runtime_error("failed to allocate VoxTral text decoder step state tensors");
+        }
+        if (turn_head_ != nullptr) {
+            ggml_backend_tensor_set(head_w1_, turn_head_->w1.data(), 0, turn_head_->w1.size() * sizeof(float));
+            ggml_backend_tensor_set(head_b1_, turn_head_->b1.data(), 0, turn_head_->b1.size() * sizeof(float));
+            ggml_backend_tensor_set(head_w2_, turn_head_->w2.data(), 0, turn_head_->w2.size() * sizeof(float));
+            ggml_backend_tensor_set(head_b2_, turn_head_->b2.data(), 0, turn_head_->b2.size() * sizeof(float));
         }
 
         core::ModuleBuildContext ctx{graph_ctx_.get(), "voxtral_realtime.text_decoder.step", backend_type_};
@@ -776,6 +866,15 @@ public:
             one_plus = core::wrap_tensor(ggml_repeat(ctx.ggml, one_plus.tensor, mlp_in.tensor), mlp_in.shape, GGML_TYPE_F32);
             mlp_in = modules::MulModule().build(ctx, mlp_in, one_plus);
             x = modules::AddModule().build(ctx, x, build_text_mlp(ctx, config, layer, mlp_in));
+            if (turn_head_ != nullptr && static_cast<int64_t>(layer_index) == turn_head_->tap) {
+                // Speakrail patch: the head reads the residual stream after this layer (the same
+                // tensor a forward hook on HF's layers[tap] returns), in f32.
+                auto * h = ggml_reshape_2d(ctx.ggml, x.tensor, config.hidden_size, 1);
+                auto * z = ggml_add(ctx.ggml, ggml_mul_mat(ctx.ggml, head_w1_, h), head_b1_);
+                z = ggml_gelu_erf(ctx.ggml, z);
+                head_logits_ = ggml_add(ctx.ggml, ggml_mul_mat(ctx.ggml, head_w2_, z), head_b2_);
+                ggml_set_output(head_logits_);
+            }
         }
         x = modules::RMSNormModule({config.hidden_size, config.rms_norm_eps, true, false})
                 .build(ctx, x, {weights_->norm, std::nullopt});
@@ -785,6 +884,9 @@ public:
         ggml_set_output(logits_);
         graph_ = ggml_new_graph_custom(graph_ctx_.get(), 65536, false);
         ggml_build_forward_expand(graph_, logits_);
+        if (head_logits_ != nullptr) {
+            ggml_build_forward_expand(graph_, head_logits_);
+        }
         gallocr_.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_)));
         if (gallocr_ == nullptr ||
             !ggml_gallocr_reserve(gallocr_.get(), graph_) ||
@@ -834,6 +936,26 @@ public:
 
     void advance_cache_after_direct_append(int64_t steps) {
         cache_.advance_after_direct_append(steps);
+    }
+
+    const std::vector<float> & last_turn_probs() const noexcept {
+        return turn_probs_;
+    }
+
+    // Speakrail patch (live peek): the K/V cache tensors into a device-side snapshot with the cache
+    // counters, and back. The attention mask is rebuilt from the restored counters on the next step.
+    void peek_save() {
+        peek_snapshot_.save(backend_, cache_state_tensors());
+        peek_valid_steps_ = cache_.valid_steps();
+        peek_current_end_ = cache_.current_end();
+        peek_turn_probs_ = turn_probs_;
+    }
+
+    void peek_restore() {
+        peek_snapshot_.restore(backend_, cache_state_tensors());
+        cache_.restore_counters(peek_valid_steps_, peek_current_end_);
+        attention_mask_prefix_uploaded_ = false;
+        turn_probs_ = peek_turn_probs_;
     }
 
     int32_t run_step(
@@ -888,6 +1010,19 @@ public:
         }
         logits_values_.resize(static_cast<size_t>(config.vocab_size));
         ggml_backend_tensor_get(logits_, logits_values_.data(), 0, logits_values_.size() * sizeof(float));
+        if (head_logits_ != nullptr) {
+            turn_probs_.resize(static_cast<size_t>(turn_head_->classes));
+            ggml_backend_tensor_get(head_logits_, turn_probs_.data(), 0, turn_probs_.size() * sizeof(float));
+            const float m = *std::max_element(turn_probs_.begin(), turn_probs_.end());
+            double total = 0.0;
+            for (auto & v : turn_probs_) {
+                v = std::exp(v - m);
+                total += v;
+            }
+            for (auto & v : turn_probs_) {
+                v = static_cast<float>(v / total);
+            }
+        }
         const auto sample_start = Clock::now();
         const int32_t next_token = sampler.select(logits_values_, options, options.seed, sample_call_index);
         if (stats != nullptr) {
@@ -901,6 +1036,20 @@ public:
     }
 
 private:
+    std::vector<ggml_tensor *> cache_state_tensors() const {
+        std::vector<ggml_tensor *> out;
+        for (size_t layer = 0; layer < cache_.num_layers(); ++layer) {
+            out.push_back(cache_.key_tensor(layer).tensor);
+            out.push_back(cache_.value_tensor(layer).tensor);
+        }
+        return out;
+    }
+
+    TensorSnapshot peek_snapshot_;
+    int64_t peek_valid_steps_ = 0;
+    int64_t peek_current_end_ = 0;
+    std::vector<float> peek_turn_probs_;
+
     void write_attention_mask(const runtime::BoundedStaticKVDecodeStep & step) {
         const auto visible = ggml_fp32_to_fp16(0.0F);
         if (!attention_mask_prefix_uploaded_) {
@@ -952,6 +1101,13 @@ private:
     int64_t uploaded_time_embedding_delay_tokens_ = std::numeric_limits<int64_t>::min();
     runtime::TransformerKVCache cache_;
     ggml_cgraph * graph_ = nullptr;
+    const TurnHeadWeights * turn_head_ = nullptr;
+    ggml_tensor * head_w1_ = nullptr;
+    ggml_tensor * head_b1_ = nullptr;
+    ggml_tensor * head_w2_ = nullptr;
+    ggml_tensor * head_b2_ = nullptr;
+    ggml_tensor * head_logits_ = nullptr;
+    std::vector<float> turn_probs_;
 };
 
 }  // namespace
@@ -964,7 +1120,8 @@ struct VoxtralRealtimeTextDecoderRuntime::Impl {
         size_t decode_graph_arena_bytes,
         size_t weight_context_bytes,
         assets::TensorStorageType storage_type,
-        int64_t stream_decode_cache_steps)
+        int64_t stream_decode_cache_steps,
+        std::string turn_head_path)
         : assets(std::move(assets)),
           backend(execution.backend()),
           backend_type(execution.backend_type()),
@@ -981,6 +1138,11 @@ struct VoxtralRealtimeTextDecoderRuntime::Impl {
             throw std::runtime_error("VoxTral stream_decode_cache_steps exceeds the model sliding window");
         }
         weights = load_weights(*this->assets, backend, backend_type, weight_context_bytes, storage_type);
+        if (!turn_head_path.empty()) {
+            turn_head = load_turn_head(
+                turn_head_path, this->assets->config.text.hidden_size, this->assets->config.text.num_hidden_layers);
+            engine::debug::timing_log_scalar("voxtral_realtime.text_decoder.turn_head.tap", turn_head->tap);
+        }
         use_offline_decode_config();
     }
 
@@ -1031,7 +1193,8 @@ struct VoxtralRealtimeTextDecoderRuntime::Impl {
                 backend_type,
                 threads,
                 cache_steps,
-                graph_arena_bytes);
+                graph_arena_bytes,
+                turn_head.get());
             engine::debug::timing_log_scalar("voxtral_realtime.text_decoder.decode_cache_steps", cache_steps);
             return graph;
         };
@@ -1118,6 +1281,7 @@ struct VoxtralRealtimeTextDecoderRuntime::Impl {
         use_stream_decode_config();
         stream_sample_call_index_ = 0;
         stream_stats_ = DecodeStepStats{};
+        last_turn_probs.clear();
         const auto decode_graph_factory = [this](int64_t cache_steps) {
             auto graph = std::make_unique<DecodeStepGraph>(
                 assets,
@@ -1126,7 +1290,8 @@ struct VoxtralRealtimeTextDecoderRuntime::Impl {
                 backend_type,
                 threads,
                 cache_steps,
-                graph_arena_bytes);
+                graph_arena_bytes,
+                turn_head.get());
             engine::debug::timing_log_scalar("voxtral_realtime.text_decoder.decode_cache_steps", cache_steps);
             return graph;
         };
@@ -1189,7 +1354,8 @@ struct VoxtralRealtimeTextDecoderRuntime::Impl {
                 backend_type,
                 threads,
                 cache_steps,
-                graph_arena_bytes);
+                graph_arena_bytes,
+                turn_head.get());
             engine::debug::timing_log_scalar("voxtral_realtime.text_decoder.decode_cache_steps", cache_steps);
             return graph;
         };
@@ -1206,6 +1372,7 @@ struct VoxtralRealtimeTextDecoderRuntime::Impl {
             sampler,
             &stream_stats_);
         decode_runtime.advance_after_direct_append(1);
+        last_turn_probs = decode_runtime.graph().last_turn_probs();
         return token;
     }
 
@@ -1230,9 +1397,36 @@ struct VoxtralRealtimeTextDecoderRuntime::Impl {
     std::shared_ptr<const TextWeights> weights;
     std::unique_ptr<FullContextGraph> prefill_graph;
     runtime::BoundedStaticKVDecodeRuntime<DecodeStepGraph> decode_runtime;
+    // Speakrail patch (live peek)
+    void peek_save() {
+        if (!decode_runtime.has_graph()) {
+            throw std::runtime_error("VoxTral peek: the text decoder stream has not started");
+        }
+        decode_runtime.graph().peek_save();
+        peek_policy = decode_runtime.policy_snapshot();
+        peek_call_index = stream_sample_call_index_;
+        peek_last_turn_probs = last_turn_probs;
+        peek_stats = stream_stats_;
+    }
+
+    void peek_restore() {
+        decode_runtime.graph().peek_restore();
+        decode_runtime.restore_policy(peek_policy);
+        stream_sample_call_index_ = peek_call_index;
+        last_turn_probs = peek_last_turn_probs;
+        stream_stats_ = peek_stats;
+    }
+
+    runtime::BoundedStaticKVDecodePolicy peek_policy;
+    uint64_t peek_call_index = 0;
+    std::vector<float> peek_last_turn_probs;
+    DecodeStepStats peek_stats;
     TokenSampler sampler;
     uint64_t stream_sample_call_index_ = 0;
     DecodeStepStats stream_stats_;
+    std::unique_ptr<TurnHeadWeights> turn_head;
+    std::vector<float> last_turn_probs;
+    std::vector<std::string> no_classes;
 };
 
 VoxtralRealtimeTextDecoderRuntime::VoxtralRealtimeTextDecoderRuntime(
@@ -1242,7 +1436,8 @@ VoxtralRealtimeTextDecoderRuntime::VoxtralRealtimeTextDecoderRuntime(
     size_t decode_graph_arena_bytes,
     size_t weight_context_bytes,
     assets::TensorStorageType weight_storage_type,
-    int64_t stream_decode_cache_steps)
+    int64_t stream_decode_cache_steps,
+    std::string turn_head_path)
     : impl_(std::make_unique<Impl>(
           std::move(assets),
           execution,
@@ -1250,7 +1445,8 @@ VoxtralRealtimeTextDecoderRuntime::VoxtralRealtimeTextDecoderRuntime(
           decode_graph_arena_bytes,
           weight_context_bytes,
           weight_storage_type,
-          stream_decode_cache_steps)) {}
+          stream_decode_cache_steps,
+          std::move(turn_head_path))) {}
 
 VoxtralRealtimeTextDecoderRuntime::~VoxtralRealtimeTextDecoderRuntime() = default;
 
@@ -1277,8 +1473,28 @@ int32_t VoxtralRealtimeTextDecoderRuntime::stream_step(
     return impl_->stream_step(previous_token, audio_embeddings, audio_row, num_delay_tokens, options);
 }
 
+void VoxtralRealtimeTextDecoderRuntime::peek_save() {
+    impl_->peek_save();
+}
+
+void VoxtralRealtimeTextDecoderRuntime::peek_restore() {
+    impl_->peek_restore();
+}
+
 bool VoxtralRealtimeTextDecoderRuntime::is_eos(int32_t token) const {
     return impl_->is_eos(token);
+}
+
+bool VoxtralRealtimeTextDecoderRuntime::has_turn_head() const {
+    return impl_->turn_head != nullptr;
+}
+
+const std::vector<std::string> & VoxtralRealtimeTextDecoderRuntime::turn_head_classes() const {
+    return impl_->turn_head != nullptr ? impl_->turn_head->names : impl_->no_classes;
+}
+
+const std::vector<float> & VoxtralRealtimeTextDecoderRuntime::last_turn_probs() const {
+    return impl_->last_turn_probs;
 }
 
 void VoxtralRealtimeTextDecoderRuntime::log_stream_timings() const {

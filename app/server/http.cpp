@@ -32,6 +32,7 @@ constexpr SocketHandle kInvalidSocket = INVALID_SOCKET;
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -718,6 +719,16 @@ UniqueSocket bind_listen_socket(const std::string & host, int port) {
 
 void handle_client(SocketHandle client, IHttpHandler & handler, uint64_t max_request_body_bytes) {
     UniqueSocket socket(client);
+    {
+        // Speakrail patch: a live transcription writes two small SSE events per 80 ms step; with Nagle on, the
+        // second waits for the first's (delayed) ACK, up to 40 ms per step.
+        const int yes = 1;
+#ifdef _WIN32
+        setsockopt(socket.get(), IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&yes), sizeof(yes));
+#else
+        setsockopt(socket.get(), IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+#endif
+    }
     try {
         std::string leftover;
         auto request = read_http_request(socket.get(), max_request_body_bytes, leftover);

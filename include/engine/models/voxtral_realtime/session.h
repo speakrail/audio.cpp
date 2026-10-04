@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace engine::models::voxtral_realtime {
 
@@ -39,14 +40,24 @@ public:
     runtime::TaskResult finish_stream() override;
     runtime::TaskResult finalize() override;
 
+    // Speakrail patch (live peek): decode `n_frames` steps of silence after the
+    // audio received so far and return their steps (token, text, frame, turn head) -- the words the live
+    // stream WILL emit for audio it has already heard, the delay line drained early. Every piece of stream
+    // state (encoder and decoder caches on the device, the session's text / step / audio bookkeeping) is
+    // snapshotted first and restored afterwards, so the live stream continues exactly as if nothing happened.
+    // Call it only between process_audio_chunk calls on the stream's own thread.
+    runtime::StreamEvent peek_stream(int64_t n_frames);
+
 private:
     VoxtralRealtimeRequest make_request(const runtime::TaskRequest & request, bool streaming) const;
     runtime::TaskResult run_single(const VoxtralRealtimeRequest & request, bool first_chunk);
     runtime::StreamEvent process_available_stream_chunks();
     runtime::StreamEvent process_one_stream_chunk(const runtime::AudioBuffer & audio);
     // Feeds a freshly decoded token back as the next stream input and, when it carries text,
-    // appends it to the transcript.
-    void record_stream_token(int32_t token);
+    // appends it to the transcript. `frame` is the audio frame the token describes (Speakrail
+    // patch: the prefill's token is frame 0, every stream step advances one 80 ms frame); the
+    // step is queued for the next event with the turn head's probabilities, when a head is loaded.
+    void record_stream_token(int32_t token, int64_t frame);
     // Moves the transcript decoded since the last partial onto the event. Called once a chunk
     // rather than once a token, so a chunk that decoded a batch of them reports all their text.
     void take_stream_delta(runtime::StreamEvent & event);
@@ -62,6 +73,11 @@ private:
     assets::TensorStorageType text_decoder_weight_storage_type_ = assets::TensorStorageType::Native;
     int64_t stream_decode_cache_steps_ = 1024;
     int64_t stream_batch_tokens_ = 1;
+    // Speakrail patch (session options): `voxtral_realtime.turn_head` = exported head file;
+    // `voxtral_realtime.stream_chunk_samples` = how many samples a live source is read in
+    // (default: one steady chunk, 1680 = 105 ms; smaller values cut the wait for a full read).
+    std::string turn_head_path_;
+    int64_t stream_chunk_samples_ = 0;
     VoxtralRealtimeTokenizer tokenizer_;
     VoxtralRealtimeFrontend frontend_;
     VoxtralRealtimeAudioEncoderRuntime audio_encoder_;
@@ -83,6 +99,8 @@ private:
     std::string streaming_text_;
     size_t streaming_published_bytes_ = 0;
     int64_t streaming_token_count_ = 0;
+    int64_t streaming_frame_ = 0;                        // frame of the last recorded token
+    std::vector<runtime::DecodedStep> pending_steps_;    // recorded since the last event
     int32_t previous_stream_token_ = 0;
     bool stream_started_ = false;
     bool first_stream_chunk_ = true;

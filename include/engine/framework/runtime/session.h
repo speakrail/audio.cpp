@@ -187,6 +187,17 @@ struct TaskResult {
     std::vector<VoiceArtifact> output_artifacts;
 };
 
+// One decoder step of a token-per-frame streaming ASR model (Speakrail patch: Voxtral realtime).
+// `frame` is the 80 ms audio frame the token describes (prompt-relative, 0 = first real audio frame);
+// `text` is the token's decoded bytes ("" for control tokens); `turn` is the turn-taking head's class
+// distribution for this step when a head is loaded (empty otherwise).
+struct DecodedStep {
+    int64_t frame = 0;
+    int32_t token = 0;
+    std::string text;
+    std::vector<float> turn;
+};
+
 struct StreamEvent {
     std::vector<VoiceActivityEvent> voice_activity;
     std::optional<Transcript> partial_text = std::nullopt;
@@ -195,6 +206,7 @@ struct StreamEvent {
     std::vector<SpeakerTurn> speaker_turns;
     std::vector<WordTimestamp> word_timestamps;
     std::vector<VoiceArtifact> output_artifacts;
+    std::vector<DecodedStep> decoded_steps;
     bool is_final = false;
 };
 

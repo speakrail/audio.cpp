@@ -51,6 +51,10 @@ public:
 
     const core::TensorValue & key_tensor(size_t layer) const;
     const core::TensorValue & value_tensor(size_t layer) const;
+    // Speakrail patch (live peek): the layer count and a way to put the step counters back after a
+    // snapshot of the K/V tensors was restored.
+    size_t num_layers() const noexcept;
+    void restore_counters(int64_t valid_steps, int64_t current_end) noexcept;
 
     void trace_log_state(const std::string & name, int64_t num_heads, int64_t head_dim) const;
 

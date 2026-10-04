@@ -185,6 +185,15 @@ int64_t TransformerKVCache::current_end() const noexcept {
     return current_end_;
 }
 
+size_t TransformerKVCache::num_layers() const noexcept {
+    return layers_.size();
+}
+
+void TransformerKVCache::restore_counters(int64_t valid_steps, int64_t current_end) noexcept {
+    valid_steps_ = valid_steps;
+    current_end_ = current_end;
+}
+
 int64_t TransformerKVCache::cache_steps() const noexcept {
     return cache_steps_;
 }

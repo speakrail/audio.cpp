@@ -1,4 +1,5 @@
 #include "engine/models/voxtral_realtime/audio_encoder.h"
+#include "engine/models/voxtral_realtime/tensor_snapshot.h"
 
 #include "engine/framework/core/backend.h"
 #include "engine/framework/core/backend_weight_store.h"
@@ -562,6 +563,14 @@ public:
         return cache_steps_;
     }
 
+    // Speakrail patch (live peek): every tensor a streaming chunk writes.
+    std::vector<ggml_tensor *> state_tensors() const {
+        std::vector<ggml_tensor *> out{conv1_cache_, conv2_cache_};
+        for (const auto & k : key_caches_) out.push_back(k.tensor);
+        for (const auto & v : value_caches_) out.push_back(v.tensor);
+        return out;
+    }
+
     void zero_all() {
         zero_convs();
         const size_t cache_bytes = ggml_nbytes(key_caches_.front().tensor);
@@ -916,6 +925,18 @@ struct VoxtralRealtimeAudioEncoderRuntime::Impl {
         return graph_slot->run(features, state);
     }
 
+    // Speakrail patch (live peek): the streaming caches into a device-side snapshot and back.
+    void peek_save() {
+        if (stream_cache == nullptr) {
+            throw std::runtime_error("VoxTral peek: the audio encoder has no streaming cache");
+        }
+        peek_snapshot.save(backend, stream_cache->state_tensors());
+    }
+
+    void peek_restore() {
+        peek_snapshot.restore(backend, stream_cache->state_tensors());
+    }
+
     void log_stream_timings() const {
         if (first_stream_graph != nullptr) {
             first_stream_graph->log_timings("first");
@@ -935,6 +956,7 @@ struct VoxtralRealtimeAudioEncoderRuntime::Impl {
     std::unique_ptr<AudioGraph> graph;
     std::unique_ptr<StreamingAudioGraph> first_stream_graph;
     std::unique_ptr<StreamingAudioGraph> steady_stream_graph;
+    TensorSnapshot peek_snapshot;
 };
 
 VoxtralRealtimeAudioEncoderRuntime::VoxtralRealtimeAudioEncoderRuntime(
@@ -958,6 +980,14 @@ VoxtralRealtimeAudioEmbeddings VoxtralRealtimeAudioEncoderRuntime::encode(const 
 
 VoxtralRealtimeAudioEncoderStreamState VoxtralRealtimeAudioEncoderRuntime::make_stream_state() const {
     return impl_->make_stream_state();
+}
+
+void VoxtralRealtimeAudioEncoderRuntime::peek_save() {
+    impl_->peek_save();
+}
+
+void VoxtralRealtimeAudioEncoderRuntime::peek_restore() {
+    impl_->peek_restore();
 }
 
 VoxtralRealtimeAudioEmbeddings VoxtralRealtimeAudioEncoderRuntime::encode_stream_chunk(

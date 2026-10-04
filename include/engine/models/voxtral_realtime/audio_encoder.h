@@ -27,6 +27,9 @@ public:
     VoxtralRealtimeAudioEmbeddings encode_stream_chunk(
         const VoxtralRealtimeFeatures & features,
         VoxtralRealtimeAudioEncoderStreamState & state);
+    // Speakrail patch (live peek): snapshot / restore every streaming cache tensor (device-side copies).
+    void peek_save();
+    void peek_restore();
     // Emits the summed upload/compute/readback split of every streaming chunk seen so far.
     void log_stream_timings() const;
 

@@ -18,6 +18,7 @@ void emit_if_nonempty(const engine::runtime::StreamEvent & event, const StreamEv
         event.speaker_turns.empty() &&
         event.word_timestamps.empty() &&
         event.output_artifacts.empty() &&
+        event.decoded_steps.empty() &&
         !event.is_final) {
         return;
     }
