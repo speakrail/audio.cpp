@@ -83,11 +83,15 @@ struct TextWeights {
 // File layout: "VXTHEAD1", int32 tap, d_in, hidden, classes,
 // f32 w1[hidden][d_in], b1[hidden], w2[classes][hidden], b2[classes], then the class names,
 // one per line, to EOF.
+// "VXTHEAD2" (anticipation heads) adds one int32 after classes: n_soft = the leading outputs under
+// the softmax; outputs [n_soft, classes) are independent sigmoids (e.g. P(turn ends within 80/160/240 ms)).
+// A VXTHEAD1 file is a VXTHEAD2 file with n_soft = classes.
 struct TurnHeadWeights {
     int64_t tap = 0;
     int64_t d_in = 0;
     int64_t hidden = 0;
     int64_t classes = 0;
+    int64_t n_soft = 0;
     std::vector<float> w1;
     std::vector<float> b1;
     std::vector<float> w2;
@@ -102,11 +106,15 @@ std::unique_ptr<TurnHeadWeights> load_turn_head(const std::string & path, int64_
     }
     char magic[8];
     in.read(magic, 8);
-    if (!in || std::memcmp(magic, "VXTHEAD1", 8) != 0) {
+    if (!in) {
         throw std::runtime_error("VoxTral turn head: bad magic in " + path);
     }
-    int32_t dims[4];
-    in.read(reinterpret_cast<char *>(dims), sizeof(dims));
+    const bool v2 = std::memcmp(magic, "VXTHEAD2", 8) == 0;
+    if (!v2 && std::memcmp(magic, "VXTHEAD1", 8) != 0) {
+        throw std::runtime_error("VoxTral turn head: bad magic in " + path);
+    }
+    int32_t dims[5] = {0, 0, 0, 0, 0};
+    in.read(reinterpret_cast<char *>(dims), static_cast<std::streamsize>((v2 ? 5 : 4) * sizeof(int32_t)));
     if (!in) {
         throw std::runtime_error("VoxTral turn head: truncated header in " + path);
     }
@@ -115,6 +123,10 @@ std::unique_ptr<TurnHeadWeights> load_turn_head(const std::string & path, int64_
     head->d_in = dims[1];
     head->hidden = dims[2];
     head->classes = dims[3];
+    head->n_soft = v2 ? dims[4] : dims[3];
+    if (head->n_soft <= 0 || head->n_soft > head->classes) {
+        throw std::runtime_error("VoxTral turn head: bad n_soft " + std::to_string(head->n_soft) + " in " + path);
+    }
     if (head->d_in != hidden_size) {
         throw std::runtime_error("VoxTral turn head: d_in " + std::to_string(head->d_in) +
                                  " != decoder hidden size " + std::to_string(hidden_size));
@@ -1017,14 +1029,20 @@ public:
         if (head_logits_ != nullptr) {
             turn_probs_.resize(static_cast<size_t>(turn_head_->classes));
             ggml_backend_tensor_get(head_logits_, turn_probs_.data(), 0, turn_probs_.size() * sizeof(float));
-            const float m = *std::max_element(turn_probs_.begin(), turn_probs_.end());
+            // softmax over the leading n_soft outputs, independent sigmoids on the rest (VXTHEAD2)
+            const auto soft_end = turn_probs_.begin() + turn_head_->n_soft;
+            const float m = *std::max_element(turn_probs_.begin(), soft_end);
             double total = 0.0;
-            for (auto & v : turn_probs_) {
-                v = std::exp(v - m);
-                total += v;
+            for (auto it = turn_probs_.begin(); it != soft_end; ++it) {
+                *it = std::exp(*it - m);
+                total += *it;
             }
-            for (auto & v : turn_probs_) {
-                v = static_cast<float>(v / total);
+            for (auto it = turn_probs_.begin(); it != soft_end; ++it) {
+                *it = static_cast<float>(*it / total);
+            }
+            for (auto it = soft_end; it != turn_probs_.end(); ++it) {
+                const float x = *it;   // numerically stable sigmoid
+                *it = x >= 0.0f ? 1.0f / (1.0f + std::exp(-x)) : std::exp(x) / (1.0f + std::exp(x));
             }
         }
         const auto sample_start = Clock::now();
